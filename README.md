@@ -2,6 +2,8 @@
 
 Relay Eval is an agent/workflow evaluation harness and release gate, not a generic metrics dashboard. It executes paired seeded trials, captures tool calls and destination state, then blocks a candidate when consequential side effects regress—even if extraction quality improves.
 
+**[Live release evidence workbench](https://relay-eval.vercel.app)** · **[Public source](https://github.com/kanwarvig/relay-eval)**
+
 The included benchmark exercises two workflows:
 
 - synthetic healthcare referral extraction and retry-safe delivery;
@@ -45,6 +47,7 @@ Task success, extraction quality, duplicate-write rate, unsupported-field rate, 
 | Version comparison and failure clusters | report `deltas` and `clusterFailures` | CLI compare test; Failure clusters UI |
 | CI release semantics | `cli/relay-eval.ts` and GitHub Actions | CLI exit tests; uploaded JSON artifact |
 | Review workflow | `review-workbench.tsx` | Playwright gate → cluster → trace flow |
+| Public release proof | Vercel production alias + zero-secret API | Playwright runs against `https://relay-eval.vercel.app`; GitHub Actions reruns the browser, gate, coverage, and publish scan |
 
 ## Design boundaries
 
