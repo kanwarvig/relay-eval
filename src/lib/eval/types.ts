@@ -78,6 +78,7 @@ export interface MetricSummary {
   duplicateWriteRate: number;
   unsupportedFieldRate: number;
   recoverySuccessRate: number;
+  recoverySampleSize: number;
   latencyP50Ms: number;
   latencyP95Ms: number;
   meanLatencyMs: number;
@@ -123,6 +124,7 @@ export interface EvaluationReport {
     trialsPerCase: number;
     confidenceLevel: 0.95;
     simulated: true;
+    simulatedEvidenceGap: boolean;
   };
   baseline: MetricSummary;
   candidate: MetricSummary;
@@ -153,4 +155,5 @@ export interface RunConfig {
   partition?: Partition | "all";
   seed?: number;
   trialsPerCase?: number;
+  simulateIncompleteEvidence?: boolean;
 }

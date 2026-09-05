@@ -7,6 +7,8 @@
 5. Inspect `gate.rules`, then `clusters`, then the cluster's `exampleRunUnitId` in `trials` to see raw trace, assertions, and final state.
 6. Never waive `hard_invariant` failures with quality gains. Repair the adapter or destination policy and create a new candidate version.
 
+Exit `3` is fail-closed evidence handling. It is exercised with `npm run eval -- gate --simulate-incomplete`, which removes a required trace from an otherwise valid run and must never be treated as a product pass/fail result.
+
 For the included unsafe fixture, CI uses `--expect block` so the workflow is green only when the known regression is caught. Real release jobs must omit that option.
 
 ## Commands

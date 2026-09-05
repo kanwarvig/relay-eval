@@ -12,12 +12,29 @@ describe("deterministic evaluation engine", () => {
     expect(benchmark.cases.filter((item) => item.partition === "held_out").every((item) => !tuning.has(item.id))).toBe(true);
   });
 
+  it("rejects content-equivalent fixture leakage even under a new id", () => {
+    const tuning = benchmark.cases.find((item) => item.partition === "tuning")!;
+    const leaked = { ...tuning, id: "renamed-held-out-copy", partition: "held_out" as const };
+    expect(() => validateTestSet({ ...benchmark, cases: [...benchmark.cases, leaked] })).toThrow(/fixtures overlap/);
+  });
+
   it("executes the adapter and captures tool calls plus inspected final state", () => {
     const testCase = benchmark.cases.find((item) => item.id === "ref-held-duplicate")!;
     const trial = executeTrial(testCase, "candidate-v1.5.0", 1701, 0);
     expect(trial.trace.map((event) => event.tool)).toContain("synthetic.clinic.deliver");
     expect(trial.finalState).toMatchObject({ referrals: 2 });
     expect(trial.assertions.find((item) => item.code === "NO_DUPLICATE_WRITE")?.passed).toBe(false);
+    expect(trial.trace.some((event) => event.tool === "synthetic.harness.restore" && event.result.freshAdapter === true)).toBe(true);
+  });
+
+  it("keeps execution independent from scorer expected values", () => {
+    const original = benchmark.cases.find((item) => item.id === "ref-held-ambiguous")!;
+    const alteredExpected = { ...original, expectedFields: { patient: "oracle-patient", reason: "oracle-reason", priority: "oracle-priority" } };
+    const actual = executeTrial(original, "candidate-v1.5.0", 1701, 0);
+    const rescored = executeTrial(alteredExpected, "candidate-v1.5.0", 1701, 0);
+    expect(rescored.trace).toEqual(actual.trace);
+    expect(rescored.finalState).toEqual(actual.finalState);
+    expect(rescored.extractionScore).not.toBe(actual.extractionScore);
   });
 
   it("proves the candidate mutation changes final state", () => {
@@ -49,6 +66,7 @@ describe("deterministic evaluation engine", () => {
     expect(report.candidate.sampleSize).toBe(12);
     expect(report.candidate.taskSuccessInterval.low).toBeLessThanOrEqual(report.candidate.taskSuccessRate);
     expect(report.candidate.taskSuccessInterval.high).toBeGreaterThanOrEqual(report.candidate.taskSuccessRate);
+    expect(report.candidate.recoverySampleSize).toBe(6);
   });
 
   it("creates stable rule-based failure clusters", () => {

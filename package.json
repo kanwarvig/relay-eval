@@ -14,9 +14,10 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
+    "publish:check": "node scripts/publish-check.mjs",
     "eval": "tsx cli/relay-eval.ts",
     "eval:gate": "tsx cli/relay-eval.ts gate --partition held_out --trials 5 --seed 1701",
-    "verify": "npm run lint && npm run typecheck && npm run test && npm run build"
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run publish:check && npm run build"
   },
   "dependencies": {
     "next": "16.3.4",

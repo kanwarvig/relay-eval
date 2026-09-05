@@ -23,4 +23,9 @@ describe("CLI", () => {
     const code = main(["run", "--partition", "secret"], () => undefined);
     expect(code).toBe(2);
   });
+
+  it("returns exit code 3 when required trace evidence is incomplete", () => {
+    const code = main(["gate", "--trials", "1", "--simulate-incomplete"], () => undefined);
+    expect(code).toBe(3);
+  });
 });

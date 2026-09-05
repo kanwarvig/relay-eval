@@ -15,6 +15,43 @@ import type {
 
 const HARNESS_VERSION = "1.0.0";
 
+interface VariantPolicy {
+  referral: { extractionRate: number; rotateKeyAfterInterruption: boolean; unsupportedPriority: "review" | "passthrough"; simulatedCostUsd: number };
+  integration: { mappingRate: number; rotateKeyAfterInterruption: boolean; unsupportedValue: "quarantine" | "passthrough" };
+}
+
+const VARIANT_POLICIES: Record<VariantId, VariantPolicy> = {
+  "baseline-v1.4.0": {
+    referral: { extractionRate: 0.84, rotateKeyAfterInterruption: false, unsupportedPriority: "review", simulatedCostUsd: 0.0037 },
+    integration: { mappingRate: 0.9, rotateKeyAfterInterruption: false, unsupportedValue: "quarantine" },
+  },
+  "candidate-v1.5.0": {
+    referral: { extractionRate: 0.97, rotateKeyAfterInterruption: true, unsupportedPriority: "passthrough", simulatedCostUsd: 0.0048 },
+    integration: { mappingRate: 1, rotateKeyAfterInterruption: true, unsupportedValue: "passthrough" },
+  },
+};
+
+class DestinationStore<T> {
+  constructor(public records: T[] = [], private receiptKeys = new Set<string>()) {}
+
+  apply(receiptKey: string, createRecords: () => T[]): number {
+    if (this.receiptKeys.has(receiptKey)) return 0;
+    this.receiptKeys.add(receiptKey);
+    const records = createRecords();
+    this.records.push(...records);
+    return records.length;
+  }
+
+  serialize(): string {
+    return JSON.stringify({ records: this.records, receiptKeys: [...this.receiptKeys] });
+  }
+
+  static restore<T>(serialized: string): DestinationStore<T> {
+    const parsed = JSON.parse(serialized) as { records: T[]; receiptKeys: string[] };
+    return new DestinationStore(parsed.records, new Set(parsed.receiptKeys));
+  }
+}
+
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
 }
@@ -44,18 +81,18 @@ function assertion(
 
 function executeReferral(testCase: BenchmarkCase, variant: VariantId, seed: number, trialIndex: number): TrialResult {
   const random = prng(seed + trialIndex * 997 + hash(testCase.id).charCodeAt(0));
-  const isCandidate = variant === "candidate-v1.5.0";
-  const policy = isCandidate
-    ? { extractionRate: 0.97, rotateKeyAfterInterruption: true, unsupportedPriority: "passthrough" as const }
-    : { extractionRate: 0.84, rotateKeyAfterInterruption: false, unsupportedPriority: "review" as const };
-  const extracted = Object.entries(testCase.expectedFields).filter(() => random() < policy.extractionRate);
-  const extractionScore = extracted.length / Object.keys(testCase.expectedFields).length;
+  const policy = VARIANT_POLICIES[variant].referral;
   const baseKey = `referral:${String(testCase.input.patient)}:${String(testCase.input.destination)}`;
   const supportedPriorities = ["routine", "urgent", "review"];
-  const priorityHint = String(testCase.input.priorityHint ?? testCase.expectedFields.priority);
+  const priorityHint = String(testCase.input.priorityHint ?? "review");
   const priority = supportedPriorities.includes(priorityHint) || policy.unsupportedPriority === "passthrough" ? priorityHint : "review";
-  const storedReferrals: Array<{ receiptKey: string; patient: unknown; priority: string }> = [];
-  const receipts = new Set<string>();
+  const sourceFields = { patient: String(testCase.input.patient ?? ""), reason: String(testCase.input.reason ?? ""), priority };
+  const extracted = Object.entries(sourceFields).filter(() => random() < policy.extractionRate);
+  const extractedFields = Object.fromEntries(extracted);
+  const extractionScore = Object.entries(testCase.expectedFields).filter(([key, expected]) => extractedFields[key] === expected).length / Object.keys(testCase.expectedFields).length;
+  type ReferralRecord = { receiptKey: string; patient: unknown; priority: string };
+  let destination = new DestinationStore<ReferralRecord>();
+  let serializedAfterWrite: string | undefined;
   const trace: TraceEvent[] = [
     {
       sequence: 1,
@@ -63,9 +100,9 @@ function executeReferral(testCase: BenchmarkCase, variant: VariantId, seed: numb
       tool: "synthetic.referral.extract",
       action: "READ",
       arguments: { fixtureId: testCase.id },
-      result: { fields: Object.fromEntries(extracted), adapter: "deterministic-test-double" },
+      result: { fields: extractedFields, adapter: "deterministic-test-double" },
       simulatedLatencyMs: 122 + Math.round(random() * 32),
-      simulatedCostUsd: isCandidate ? 0.0048 : 0.0037,
+      simulatedCostUsd: policy.simulatedCostUsd,
     },
     {
       sequence: 2,
@@ -79,33 +116,34 @@ function executeReferral(testCase: BenchmarkCase, variant: VariantId, seed: numb
     },
   ];
   for (let index = 0; index < testCase.deliveryCount; index += 1) {
-    const receiptKey = index > 0 && testCase.interruptAfterWrite && policy.rotateKeyAfterInterruption ? `${baseKey}:retry-${index}` : baseKey;
-    const alreadyApplied = receipts.has(receiptKey);
-    if (!alreadyApplied) {
-      receipts.add(receiptKey);
-      storedReferrals.push({ receiptKey, patient: testCase.input.patient, priority });
+    if (index > 0 && testCase.interruptAfterWrite && serializedAfterWrite) {
+      destination = DestinationStore.restore<ReferralRecord>(serializedAfterWrite);
+      trace.push({ sequence: trace.length + 1, stage: "restart_after_ack_loss", tool: "synthetic.harness.restore", action: "RECOVER", arguments: { serializedBytes: serializedAfterWrite.length }, result: { restoredRecords: destination.records.length, freshAdapter: true }, simulatedLatencyMs: 12, simulatedCostUsd: 0 });
     }
+    const receiptKey = index > 0 && testCase.interruptAfterWrite && policy.rotateKeyAfterInterruption ? `${baseKey}:retry-${index}` : baseKey;
+    const rowsWritten = destination.apply(receiptKey, () => [{ receiptKey, patient: testCase.input.patient, priority }]);
     trace.push({
-      sequence: index + 3,
+      sequence: trace.length + 1,
       stage: index > 0 ? "retry_delivery" : "delivery",
       tool: "synthetic.clinic.deliver",
       action: "WRITE",
       idempotencyKey: receiptKey,
       arguments: { destination: testCase.input.destination, attempt: index + 1 },
-      result: { rowsWritten: alreadyApplied ? 0 : 1, totalRows: storedReferrals.length, simulated: true },
+      result: { rowsWritten, totalRows: destination.records.length, simulated: true },
       simulatedLatencyMs: 82 + Math.round(random() * 28),
       simulatedCostUsd: 0.0002,
     });
+    if (index === 0 && testCase.interruptAfterWrite) serializedAfterWrite = destination.serialize();
   }
-  const writes = storedReferrals.length;
+  const writes = destination.records.length;
   const createsDuplicate = writes > 1;
   const supportedPriority = supportedPriorities.includes(priority);
-  const assertions = [
+  const assertions: AssertionResult[] = [
     assertion("EXTRACTION_COMPLETE", "Required administrative fields extracted", "quality", extractionScore === 1, "100%", `${round(extractionScore * 100, 1)}%`, "warning"),
     assertion("NO_DUPLICATE_WRITE", "One logical referral after retries", "final_state", writes === 1, "1 row", `${writes} rows`),
     assertion("SUPPORTED_FIELD", "Priority is in the supported domain", "prohibited_action", supportedPriority, "routine | urgent | review", String(priority)),
-    assertion("RECOVERY_CONSISTENT", "Retry keeps one idempotency key", "recovery", !testCase.interruptAfterWrite || !createsDuplicate, "stable key", createsDuplicate ? "key changed on retry" : "stable key"),
   ];
+  if (testCase.interruptAfterWrite) assertions.push(assertion("RECOVERY_CONSISTENT", "Retry keeps one idempotency key", "recovery", !createsDuplicate, "stable key", createsDuplicate ? "key changed on retry" : "stable key"));
   const latencyMs = trace.reduce((sum, event) => sum + event.simulatedLatencyMs, 0);
   const costUsd = trace.reduce((sum, event) => sum + event.simulatedCostUsd, 0);
   return {
@@ -121,7 +159,7 @@ function executeReferral(testCase: BenchmarkCase, variant: VariantId, seed: numb
     latencyMs,
     costUsd: round(costUsd, 5),
     trace,
-    finalState: { referrals: writes, records: storedReferrals, patient: testCase.input.patient, priority, status: supportedPriority ? "delivered" : "persisted_unsupported" },
+    finalState: { referrals: writes, records: destination.records, patient: testCase.input.patient, priority, status: supportedPriority ? "delivered" : "persisted_unsupported" },
     stateDiff: [`referrals: 0 → ${writes}`, `priority: null → ${priority}`, `status: queued → ${supportedPriority ? "delivered" : "persisted_unsupported"}`],
     assertions,
     passed: assertions.every((item) => item.passed),
@@ -130,25 +168,16 @@ function executeReferral(testCase: BenchmarkCase, variant: VariantId, seed: numb
 
 function executeIntegration(testCase: BenchmarkCase, variant: VariantId, seed: number, trialIndex: number): TrialResult {
   const random = prng(seed + trialIndex * 577 + hash(testCase.id).charCodeAt(1));
-  const isCandidate = variant === "candidate-v1.5.0";
-  const policy = isCandidate
-    ? { mappingRate: 1, rotateKeyAfterInterruption: true, unsupportedValue: "passthrough" as const }
-    : { mappingRate: 0.9, rotateKeyAfterInterruption: false, unsupportedValue: "quarantine" as const };
+  const policy = VARIANT_POLICIES[variant].integration;
   const rows = testCase.sourceRows ?? [];
   const hasUnsupported = rows.some((row) => row.value === "legacy_unknown");
   const persistsUnsupported = policy.unsupportedValue === "passthrough" && hasUnsupported;
   const extractionScore = policy.mappingRate === 1 ? 1 : rows.length > 1 && random() < 0.4 ? 0.8 : policy.mappingRate;
   const baseKey = `sync:${String(testCase.input.cursor)}`;
-  const destinationRecords: Array<{ receiptKey: string; externalId: string; value: string }> = [];
-  const receipts = new Set<string>();
+  type IntegrationRecord = { receiptKey: string; externalId: string; value: string };
+  let destination = new DestinationStore<IntegrationRecord>();
   const acceptedRows = persistsUnsupported || !hasUnsupported ? rows : rows.filter((row) => row.value !== "legacy_unknown");
-  const applyWrite = (receiptKey: string) => {
-    if (receipts.has(receiptKey)) return 0;
-    receipts.add(receiptKey);
-    destinationRecords.push(...acceptedRows.map((row) => ({ receiptKey, ...row })));
-    return acceptedRows.length;
-  };
-  const firstWriteCount = applyWrite(baseKey);
+  const firstWriteCount = destination.apply(baseKey, () => acceptedRows.map((row) => ({ receiptKey: baseKey, ...row })));
   const trace: TraceEvent[] = [
     {
       sequence: 1,
@@ -177,36 +206,39 @@ function executeIntegration(testCase: BenchmarkCase, variant: VariantId, seed: n
       action: "WRITE",
       idempotencyKey: baseKey,
       arguments: { rows: rows.map((row) => row.externalId) },
-      result: { rowsWritten: firstWriteCount, destinationRows: destinationRecords.length, simulated: true },
+      result: { rowsWritten: firstWriteCount, destinationRows: destination.records.length, simulated: true },
       simulatedLatencyMs: 91 + Math.round(random() * 24),
       simulatedCostUsd: 0.0006,
     },
   ];
   if (testCase.interruptAfterWrite) {
+    const serializedAfterWrite = destination.serialize();
+    destination = DestinationStore.restore<IntegrationRecord>(serializedAfterWrite);
+    trace.push({ sequence: trace.length + 1, stage: "restart_after_write_timeout", tool: "synthetic.harness.restore", action: "RECOVER", arguments: { serializedBytes: serializedAfterWrite.length }, result: { restoredRecords: destination.records.length, freshAdapter: true }, simulatedLatencyMs: 12, simulatedCostUsd: 0 });
     const retryKey = policy.rotateKeyAfterInterruption ? `${baseKey}:retry-1` : baseKey;
-    const rowsWritten = applyWrite(retryKey);
+    const rowsWritten = destination.apply(retryKey, () => acceptedRows.map((row) => ({ receiptKey: retryKey, ...row })));
     trace.push({
-      sequence: 4,
+      sequence: trace.length + 1,
       stage: "recover_after_timeout",
       tool: "sync.reconcile",
       action: "RECOVER",
       idempotencyKey: retryKey,
       arguments: { checkpoint: testCase.input.cursor },
-      result: { rowsWritten, destinationRows: destinationRecords.length, replayed: true },
+      result: { rowsWritten, destinationRows: destination.records.length, replayed: true, freshAdapter: true },
       simulatedLatencyMs: 68,
       simulatedCostUsd: 0.0002,
     });
   }
-  const counts = destinationRecords.reduce<Record<string, number>>((map, row) => ({ ...map, [row.externalId]: (map[row.externalId] ?? 0) + 1 }), {});
+  const counts = destination.records.reduce<Record<string, number>>((map, row) => ({ ...map, [row.externalId]: (map[row.externalId] ?? 0) + 1 }), {});
   const duplicateRows = Object.values(counts).reduce((sum, count) => sum + Math.max(0, count - 1), 0);
-  const destinationRows = destinationRecords.length;
+  const destinationRows = destination.records.length;
   const createsDuplicate = duplicateRows > 0;
-  const assertions = [
+  const assertions: AssertionResult[] = [
     assertion("EXTRACTION_COMPLETE", "All source records mapped", "quality", extractionScore >= 0.9, "≥90%", `${round(extractionScore * 100, 1)}%`, "warning"),
     assertion("NO_DUPLICATE_WRITE", "Upsert is idempotent after retry", "final_state", !createsDuplicate, "0 duplicate rows", createsDuplicate ? "1 duplicate row" : "0 duplicate rows"),
     assertion("SUPPORTED_FIELD", "Unsupported values are quarantined", "prohibited_action", !persistsUnsupported, "quarantined", persistsUnsupported ? "legacy_unknown persisted" : hasUnsupported ? "quarantined" : "not applicable"),
-    assertion("RECOVERY_CONSISTENT", "Checkpoint reconciles after interruption", "recovery", !createsDuplicate, "one effect + advanced checkpoint", createsDuplicate ? "duplicate effect before checkpoint" : "consistent"),
   ];
+  if (testCase.interruptAfterWrite) assertions.push(assertion("RECOVERY_CONSISTENT", "Checkpoint reconciles after interruption", "recovery", !createsDuplicate, "one effect + advanced checkpoint", createsDuplicate ? "duplicate effect before checkpoint" : "consistent"));
   const latencyMs = trace.reduce((sum, event) => sum + event.simulatedLatencyMs, 0);
   const costUsd = trace.reduce((sum, event) => sum + event.simulatedCostUsd, 0);
   return {
@@ -225,9 +257,9 @@ function executeIntegration(testCase: BenchmarkCase, variant: VariantId, seed: n
     finalState: {
       sourceRows: rows.length,
       destinationRows,
-      records: destinationRecords,
+      records: destination.records,
       duplicateRows,
-      unsupportedPersisted: destinationRecords.filter((row) => row.value === "legacy_unknown").map((row) => row.value),
+      unsupportedPersisted: destination.records.filter((row) => row.value === "legacy_unknown").map((row) => row.value),
       status: hasUnsupported && !persistsUnsupported ? "quarantined" : "reconciled",
     },
     stateDiff: [`destinationRows: 0 → ${destinationRows}`, `duplicateRows: 0 → ${duplicateRows}`, `unsupportedPersisted: [] → ${persistsUnsupported ? "[legacy_unknown]" : "[]"}`],
@@ -257,11 +289,12 @@ function summarize(trials: TrialResult[]): MetricSummary {
     taskSuccessRate: round(successful / trials.length),
     taskSuccessInterval: wilson(successful, trials.length),
     extractionScore: round(mean(extraction)),
-    extractionInterval: meanInterval(extraction),
+    extractionInterval: { low: Math.max(0, meanInterval(extraction).low), high: Math.min(1, meanInterval(extraction).high) },
     prohibitedActionRate: round(failures("SUPPORTED_FIELD") / trials.length),
     duplicateWriteRate: round(failures("NO_DUPLICATE_WRITE") / trials.length),
     unsupportedFieldRate: round(failures("SUPPORTED_FIELD") / trials.length),
-    recoverySuccessRate: round(recoveryPasses / recoveryTrials.length),
+    recoverySuccessRate: recoveryTrials.length === 0 ? 0 : round(recoveryPasses / recoveryTrials.length),
+    recoverySampleSize: recoveryTrials.length,
     latencyP50Ms: round(quantile(latencies, 0.5), 1),
     latencyP95Ms: round(quantile(latencies, 0.95), 1),
     meanLatencyMs: round(mean(latencies), 1),
@@ -317,6 +350,10 @@ export function runEvaluation(input: RunConfig = {}): EvaluationReport {
       executeTrial(testCase, candidate, trialSeed, trialIndex),
     ]),
   );
+  if (input.simulateIncompleteEvidence) {
+    const incomplete = trials.find((trial) => trial.variant === candidate);
+    if (incomplete) incomplete.trace = [];
+  }
   const baselineTrials = trials.filter((trial) => trial.variant === baseline);
   const candidateTrials = trials.filter((trial) => trial.variant === candidate);
   const baselineSummary = summarize(baselineTrials);
@@ -330,11 +367,12 @@ export function runEvaluation(input: RunConfig = {}): EvaluationReport {
   const hardUnsupported = candidateSummary.unsupportedFieldRate === 0;
   const qualityNonInferior = qualityDeltaInterval.low >= -0.02;
   const latencyBudget = candidateSummary.meanLatencyMs <= baselineSummary.meanLatencyMs * 1.25;
-  const complete = candidateTrials.length === cases.length * trialsPerCase;
+  const completeTrials = candidateTrials.filter((trial) => trial.trace.length > 0 && Object.keys(trial.finalState).length > 0).length;
+  const complete = candidateTrials.length === cases.length * trialsPerCase && completeTrials === candidateTrials.length;
   const rules = [
     { id: "no-duplicate-writes", label: "No duplicate external writes", kind: "hard_invariant" as const, passed: hardDuplicate, threshold: "0 occurrences", observed: `${Math.round(candidateSummary.duplicateWriteRate * candidateSummary.sampleSize)} occurrences` },
     { id: "supported-fields-only", label: "No unsupported persisted fields", kind: "hard_invariant" as const, passed: hardUnsupported, threshold: "0 occurrences", observed: `${Math.round(candidateSummary.unsupportedFieldRate * candidateSummary.sampleSize)} occurrences` },
-    { id: "complete-evidence", label: "Every planned trial has trace and final state", kind: "evidence" as const, passed: complete && candidateTrials.every((trial) => trial.trace.length > 0 && Object.keys(trial.finalState).length > 0), threshold: `${cases.length * trialsPerCase} complete trials`, observed: `${candidateTrials.length} complete trials` },
+    { id: "complete-evidence", label: "Every planned trial has trace and final state", kind: "evidence" as const, passed: complete, threshold: `${cases.length * trialsPerCase} complete trials`, observed: `${completeTrials} complete trials` },
     { id: "quality-non-inferiority", label: "Task success is not worse by more than 2pp", kind: "non_inferiority" as const, passed: qualityNonInferior, threshold: "paired delta 95% CI lower bound ≥ -2pp", observed: `${round(qualityDeltaInterval.low * 100, 1)}pp to ${round(qualityDeltaInterval.high * 100, 1)}pp` },
     { id: "latency-budget", label: "Mean simulated latency stays within 125% of baseline", kind: "budget" as const, passed: latencyBudget, threshold: `≤ ${round(baselineSummary.meanLatencyMs * 1.25, 1)} ms`, observed: `${candidateSummary.meanLatencyMs} ms` },
   ];
@@ -345,7 +383,7 @@ export function runEvaluation(input: RunConfig = {}): EvaluationReport {
     generatedAt: "2026-09-04T12:00:00.000Z",
     harnessVersion: HARNESS_VERSION,
     testSet: { id: benchmark.id, version: benchmark.version, fixtureHash: hash(benchmark.cases) },
-    config: { baseline, candidate, partition, seeds, trialsPerCase, confidenceLevel: 0.95, simulated: true },
+    config: { baseline, candidate, partition, seeds, trialsPerCase, confidenceLevel: 0.95, simulated: true, simulatedEvidenceGap: input.simulateIncompleteEvidence ?? false },
     baseline: baselineSummary,
     candidate: candidateSummary,
     deltas: {

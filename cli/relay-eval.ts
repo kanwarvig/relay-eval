@@ -18,7 +18,7 @@ function help() {
 Usage:
   relay-eval run [--partition held_out|tuning|all] [--trials 5] [--seed 1701] [--out report.json]
   relay-eval compare [same options]
-  relay-eval gate [same options] [--expect pass|block]
+  relay-eval gate [same options] [--expect pass|block] [--simulate-incomplete]
   relay-eval report [same options] [--out report.json]
 
 Exit codes: 0 pass/success, 1 valid run blocked, 2 invalid arguments, 3 incomplete evidence.`;
@@ -43,7 +43,7 @@ export function main(args = process.argv.slice(2), write: Writer = (message) => 
     if (!Number.isInteger(trialsPerCase) || trialsPerCase < 1 || trialsPerCase > 25) throw new Error("Trials must be an integer from 1 to 25");
     if (!Number.isInteger(seed) || seed < 0) throw new Error("Seed must be a non-negative integer");
     if (!["baseline-v1.4.0", "candidate-v1.5.0"].includes(candidate)) throw new Error(`Unknown candidate: ${candidate}`);
-    const report = runEvaluation({ partition, trialsPerCase, seed, candidate });
+    const report = runEvaluation({ partition, trialsPerCase, seed, candidate, simulateIncompleteEvidence: args.includes("--simulate-incomplete") });
     const output = command === "compare"
       ? { runId: report.runId, baseline: report.baseline, candidate: report.candidate, deltas: report.deltas, gate: report.gate }
       : report;
@@ -60,6 +60,7 @@ export function main(args = process.argv.slice(2), write: Writer = (message) => 
     if (command === "gate") {
       const expected = option(args, "--expect");
       if (expected && !["pass", "block"].includes(expected)) return 2;
+      if (report.gate.rules.some((rule) => rule.kind === "evidence" && !rule.passed)) return 3;
       if (expected) return expected.toUpperCase() === report.gate.status ? 0 : 1;
       return report.gate.status === "PASS" ? 0 : 1;
     }

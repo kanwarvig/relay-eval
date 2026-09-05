@@ -15,11 +15,11 @@ quality scoring            final-state assertions
        CLI / JSON API / review UI / CI
 ```
 
-The benchmark supplies inputs and injected fault timing. It does not supply outcomes. Each adapter runs operations against an isolated in-memory destination, records actual tool results, and derives assertions from the resulting records and receipts.
+The benchmark supplies inputs and injected fault timing. It does not supply outcomes. Each adapter runs operations against an isolated in-memory destination, records actual tool results, and derives assertions from the resulting records and receipts. Post-write faults serialize the store, discard the live adapter, restore a fresh instance, and replay from the recorded checkpoint.
 
 ## Boundaries
 
-- `src/lib/eval/benchmark.ts` owns the immutable `2026.09.1` manifest and split.
+- `src/lib/eval/fixtures/tuning.ts` and `fixtures/held-out.ts` are physically separate manifests joined by `benchmark.ts`; validation rejects repeated IDs and content-equivalent inputs across splits.
 - `src/lib/eval/engine.ts` owns execution, traces, final-state inspection, summaries, clustering, and the gate.
 - `src/lib/eval/types.ts` is the versioned interface shared by every consumer.
 - `cli/relay-eval.ts`, `app/api/runs`, and the review workbench adapt the same report without reimplementing evaluation rules.
